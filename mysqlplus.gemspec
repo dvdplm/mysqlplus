@@ -12,12 +12,15 @@ Gem::Specification.new do |s|
   s.files    = [ 
 		"mysqlplus.gemspec", 
 		"README",
+		"Rakefile",
 		"lib/mysqlplus.rb",
-		"test/test_threaded.rb",
-		"test/test_evented.rb",
+		"test/test_helper.rb",
+		"test/native_threaded_test.rb",
+		"test/c_threaded_test.rb",
+		"test/evented_test.rb",
+		"ext/error_const.h",
 		"ext/extconf.rb",
-		"ext/mysql.c",
-		"ext/Makefile"	
+		"ext/mysql.c"
 	]
   s.rdoc_options = ["--main", "README"]
   s.extra_rdoc_files = ["README"]

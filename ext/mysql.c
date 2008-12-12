@@ -60,6 +60,7 @@ struct mysql {
     MYSQL handler;
     char connection;
     char query_with_result;
+    char blocking;
 };
 
 struct mysql_res {
@@ -268,6 +269,14 @@ static VALUE real_connect(int argc, VALUE* argv, VALUE klass)
 
     myp->handler.reconnect = 0;
     myp->connection = Qtrue;
+
+    my_bool was_blocking;
+
+    vio_blocking(myp->handler.net.vio, 0, &was_blocking);    
+    myp->blocking = vio_is_blocking( myp->handler.net.vio );
+
+    vio_fastsend( myp->handler.net.vio );
+
     myp->query_with_result = Qtrue;
     rb_obj_call_init(obj, argc, argv);
 
@@ -753,13 +762,42 @@ static VALUE query(VALUE obj, VALUE sql)
 static VALUE socket(VALUE obj)
 {
     MYSQL* m = GetHandler(obj);
-    return INT2NUM(vio_fd(m->net.vio));
+    return INT2NUM(m->net.fd);
+}
+/* socket_type */
+static VALUE socket_type(VALUE obj)
+{
+    MYSQL* m = GetHandler(obj);
+    VALUE description = vio_description( m->net.vio );
+    return NILorSTRING( description );
 }
 
-/* send_query */
+/* blocking */
+static VALUE blocking(VALUE obj){
+  return ( GetMysqlStruct(obj)->blocking ? Qtrue : Qfalse );
+}
+
+/* readable(timeout=nil) */
+static VALUE readable( int argc, VALUE* argv, VALUE obj )
+{
+    MYSQL* m = GetHandler(obj);
+
+    VALUE timeout;  
+    
+    rb_scan_args(argc, argv, "01", &timeout);
+
+    if ( NIL_P( timeout ) ){
+      timeout = m->net.read_timeout;
+    }
+
+    return ( vio_poll_read( m->net.vio, INT2NUM(timeout) ) == 0 ? Qtrue : Qfalse );
+}
+
+/* send_query(sql) */
 static VALUE send_query(VALUE obj, VALUE sql)
 {
     MYSQL* m = GetHandler(obj);
+
     Check_Type(sql, T_STRING);
     if (GetMysqlStruct(obj)->connection == Qfalse) {
         rb_raise(eMysql, "query: not connected");
@@ -785,17 +823,38 @@ static VALUE get_result(VALUE obj)
     return store_result(obj);
 }
 
-/* async_query */
-/*
-comment it out until I figure out how it works
-static VALUE async_query(VALUE obj, VALUE sql)
+static VALUE schedule(VALUE obj, VALUE timeout)
 {
+    MYSQL* m = GetHandler(obj);
+    fd_set read;
+
+    timeout = ( NIL_P(timeout) ? m->net.read_timeout : INT2NUM(timeout) );
+
+    struct timeval tv = { tv_sec: timeout, tv_usec: 0 };
+
+    FD_ZERO(&read);
+    FD_SET(m->net.fd, &read);
+
+    if (rb_thread_select(m->net.fd + 1, &read, NULL, NULL, &tv) < 0) {
+      rb_raise(eMysql, "query: timeout");
+    }
+
+}
+
+/* async_query(sql,timeout=nil) */
+static VALUE async_query(int argc, VALUE* argv, VALUE obj)
+{
+  MYSQL* m = GetHandler(obj); 
+  VALUE sql, timeout;
+
+  rb_scan_args(argc, argv, "11", &sql, &timeout);
+
   send_query(obj,sql);
-	rb_io_wait_readable(socket(obj));
+
+  schedule(obj, timeout);
+
   return get_result(obj);
 }
-*/
-
 
 #if MYSQL_VERSION_ID >= 40100
 /*	server_version()	*/
@@ -1069,18 +1128,17 @@ static VALUE process_all_hashes(VALUE obj, VALUE with_table, int build_array, in
 {
     MYSQL_RES* res = GetMysqlRes(obj);
     unsigned int n = mysql_num_fields(res);
-    VALUE ary;
+    VALUE ary = Qnil;
     if(build_array)
-	ary = rb_ary_new();
-    MYSQL_ROW row = mysql_fetch_row(res); // need one early to determine the columns
+  	ary = rb_ary_new();
+    MYSQL_ROW row = mysql_fetch_row(res); // grab one off the top, to determine the rows
     if (row == NULL){
-        if(build_array){
-            return ary;
-        }else{
-	    return Qnil;
-        }
+      if(build_array){
+        return ary;
+      }else{
+        return Qnil;
+      }
     }
-    unsigned long* lengths = mysql_fetch_lengths(res);
     MYSQL_FIELD* fields = mysql_fetch_fields(res);
     unsigned int i;
     VALUE hash;
@@ -1114,9 +1172,11 @@ static VALUE process_all_hashes(VALUE obj, VALUE with_table, int build_array, in
         }
     }
 
+    unsigned long* lengths = NULL;
     while(row != NULL)
     {
       hash = rb_hash_new();
+      lengths = mysql_fetch_lengths(res);
       for (i=0; i<n; i++) {
         rb_hash_aset(hash, rb_ary_entry(colname, i), row[i]? rb_tainted_str_new(row[i], lengths[i]): Qnil);
       }
@@ -1128,11 +1188,15 @@ static VALUE process_all_hashes(VALUE obj, VALUE with_table, int build_array, in
 
       row = mysql_fetch_row(res);
     }
+
+    /* pass back apropriate return values */
     if(build_array)
 	return ary;
    
     if(yield)
 	return obj;
+
+    return Qnil; /* we should never get here -- this takes out a compiler warning */
 }
 
 /*	fetch_hash2 (internal)	*/
@@ -1150,7 +1214,7 @@ static VALUE fetch_hash2(VALUE obj, VALUE with_table)
 	return Qnil;
     hash = rb_hash_new();
 
-    if (with_table == Qnil || with_table == Qfalse) {
+    if (with_table == Qfalse) {
         colname = rb_iv_get(obj, "colname");
         if (colname == Qnil) {
             colname = rb_ary_new2(n);
@@ -1267,13 +1331,11 @@ static VALUE each(VALUE obj)
 static VALUE each_hash(int argc, VALUE* argv, VALUE obj)
 {
     VALUE with_table;
-    VALUE hash;
     check_free(obj);
     rb_scan_args(argc, argv, "01", &with_table);
     if (with_table == Qnil)
 	with_table = Qfalse;
-    while ((hash = fetch_hash2(obj, with_table)) != Qnil)
-	rb_yield(hash);
+    process_all_hashes(obj, with_table, 0, 1);
     return obj;
 }
 
@@ -1281,9 +1343,6 @@ static VALUE each_hash(int argc, VALUE* argv, VALUE obj)
 static VALUE all_hashes(int argc, VALUE* argv, VALUE obj)
 {
     VALUE with_table;
-    VALUE field_names;
-    VALUE res;
-    unsigned int n,i;
     check_free(obj);
     rb_scan_args(argc, argv, "01", &with_table);
     if (with_table == Qnil)
@@ -2087,10 +2146,13 @@ void Init_mysql(void)
 #endif
     rb_define_method(cMysql, "query", query, 1);
     rb_define_method(cMysql, "real_query", query, 1);
-    /*rb_define_method(cMysql, "async_query", async_query, 1);*/
+    rb_define_method(cMysql, "c_async_query", async_query, -1);
     rb_define_method(cMysql, "send_query", send_query, 1);
     rb_define_method(cMysql, "get_result", get_result, 0);
+    rb_define_method(cMysql, "readable?", readable, -1);
+    rb_define_method(cMysql, "blocking?", blocking, 0);
     rb_define_method(cMysql, "socket", socket, 0);
+    rb_define_method(cMysql, "socket_type", socket_type, 0);
     rb_define_method(cMysql, "refresh", refresh, 1);
     rb_define_method(cMysql, "reload", reload, 0);
     rb_define_method(cMysql, "select_db", select_db, 1);
@@ -2242,7 +2304,7 @@ void Init_mysql(void)
     rb_define_method(cMysqlRes, "row_tell", row_tell, 0);
     rb_define_method(cMysqlRes, "each", each, 0);
     rb_define_method(cMysqlRes, "each_hash", each_hash, -1);
-    /*rb_define_method(cMysqlRes, "all_hashes", all_hashes, -1);*/
+    rb_define_method(cMysqlRes, "all_hashes", all_hashes, -1);
 
     /* MysqlField object method */
     rb_define_method(cMysqlField, "name", field_name, 0);

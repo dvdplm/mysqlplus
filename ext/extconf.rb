@@ -1,5 +1,6 @@
 require 'mkmf'
 
+
 if /mswin32/ =~ RUBY_PLATFORM
   inc, lib = dir_config('mysql')
   exit 1 unless have_library("libmysql")
@@ -29,6 +30,10 @@ elsif have_header('mysql/mysql.h') then
   src = "#include <mysql/errmsg.h>\n#include <mysql/mysqld_error.h>\n"
 else
   exit 1
+end
+
+if have_func('rb_thread_blocking_region') and have_macro('RUBY_UBF_IO', 'ruby.h')
+  $CPPFLAGS << " -DHAVE_TBR"
 end
 
 # make mysql constant
